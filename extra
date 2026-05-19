@@ -1,0 +1,95 @@
+Great question. There are four realistic options, each with different trade-offs:
+
+---
+
+## Option A — Build a Custom MCP Tool (Recommended)
+
+Add a `kintone-upload-file` tool directly inside your own fork or wrapper of the official server. The MCP SDK makes this straightforward in TypeScript:
+
+```typescript
+server.tool(
+  "kintone-upload-file",
+  "Upload a file to Kintone and return its fileKey for use in record fields",
+  {
+    fileName: z.string(),
+    mimeType: z.string(),
+    base64Content: z.string().describe("Base64-encoded file content")
+  },
+  async ({ fileName, mimeType, base64Content }) => {
+    const buffer = Buffer.from(base64Content, 'base64');
+    const form = new FormData();
+    form.append('file', new Blob([buffer], { type: mimeType }), fileName);
+
+    const res = await fetch(`${process.env.KINTONE_BASE_URL}/k/v1/file.json`, {
+      method: 'POST',
+      headers: { 'X-Cybozu-API-Token': process.env.KINTONE_API_TOKEN },
+      body: form
+    });
+
+    const { fileKey } = await res.json();
+    return { content: [{ type: "text", text: JSON.stringify({ fileKey }) }] };
+  }
+);
+```
+
+**Pros:** Keeps everything inside the MCP layer — no new infrastructure, consistent with Method 3 architecture, the agent gets a `fileKey` it can immediately pass to `kintone-update-records`.
+
+**Cons:** You own the tool indefinitely; if Cybozu officially adds `kintone-upload-file` upstream, you'll need to migrate. Also, passing large files as base64 through the LLM context is impractical — see the size caveat below.
+
+**Size caveat:** This only works well for small files (<1 MB). For larger files, the base64 payload bloats the JSON-RPC message and the agent context. For larger files, see Option C.
+
+---
+
+## Option B — Use the Community Fork (r3-yamauchi/kintone-mcp-server)
+
+This unofficial fork already includes `upload_file`. You swap the container image reference:
+
+```bash
+# Instead of ghcr.io/kintone/mcp-server:latest
+--image ghcr.io/r3-yamauchi/kintone-mcp-server:latest
+```
+
+**Pros:** Zero build effort — upload works immediately.
+
+**Cons:** No Cybozu backing whatsoever. The fork may fall behind or be abandoned. You'd need to audit the code before using it with production API tokens. Not appropriate for enterprise/regulated environments without a formal vendor assessment.
+
+---
+
+## Option C — Pre-signed Upload via MCP + Direct Agent POST (Hybrid)
+
+For larger files, a cleaner pattern is a two-step flow:
+
+1. The agent calls a custom MCP tool `kintone-get-upload-url` which returns a short-lived Azure Blob SAS URL (or similar staging endpoint).
+2. The calling system uploads the file directly to that URL (outside the agent loop).
+3. The agent calls a second custom tool `kintone-submit-staged-file` which reads from blob storage and POSTs to Kintone `/k/v1/file.json`, returning the `fileKey`.
+
+This decouples file bytes from the agent context entirely. It's the right architecture for files >1 MB.
+
+**Pros:** Scales to any file size; agent context stays clean; staging layer gives you virus scanning / validation opportunity.
+
+**Cons:** Adds Azure Blob Storage to the dependency graph; more complex to build and test.
+
+---
+
+## Option D — Keep Method 2's Azure Function Bridge for Upload Only (Pragmatic Fallback)
+
+Rather than replacing the Function, you run Method 3 for all record operations (the 4 natively covered) and route only file upload calls through the existing Method 2 Azure Function. The agent has two tool registrations: the MCP server for records, and the OpenAPI spec for file upload.
+
+**Pros:** No new build work if the Function already exists from a Method 2 spike; you get Method 3 benefits for the 80%+ of calls that are record operations.
+
+**Cons:** Architecture is split across two tool types — harder to explain, test, and maintain. Approval handling applies to both tool paths. Probably a temporary bridge, not a long-term target.
+
+---
+
+## Recommendation Matrix
+
+| Option | Build Effort | File Size Limit | Enterprise-Safe | Long-term Maintainability |
+|---|---|---|---|---|
+| A — Custom MCP tool | Low (1–2 days) | ~1 MB | ✅ | ✅ (you own it) |
+| B — Community fork | Minimal | ~1 MB | ⚠️ Needs audit | ❌ Risky |
+| C — Staged upload (hybrid) | Medium (3–5 days) | Unlimited | ✅ | ✅ |
+| D — Azure Function fallback | None | Unlimited | ✅ | ⚠️ Split architecture |
+
+**For most teams: Option A** for small files, **Option C** if your use case involves files larger than 1 MB. Option D is a reasonable short-term bridge if the Function already exists and you're not ready to build A or C yet.
+
+Would you like me to write the full implementation for Option A or Option C, or update the investigation document to include this analysis?
